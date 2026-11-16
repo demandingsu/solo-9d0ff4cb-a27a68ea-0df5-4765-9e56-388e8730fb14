@@ -15,7 +15,7 @@ import time
 from contextlib import contextmanager
 from typing import Iterator
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ports (
@@ -104,6 +104,21 @@ CREATE TABLE IF NOT EXISTS event_changes (
 
 CREATE INDEX IF NOT EXISTS idx_event_changes_port_seq
     ON event_changes (port_id, seq);
+
+-- Immutable point-level evidence snapshot captured at the moment an event id
+-- is published (the upsert that creates it).  Rows are written once and never
+-- updated or deleted, so a retracted id keeps answering for exactly the
+-- observations the event was based on, while its replacement id gets its own
+-- snapshot that includes any late points.  Re-uploading an identical point is
+-- deduplicated against raw_points and therefore cannot alter this table.
+CREATE TABLE IF NOT EXISTS event_evidence (
+    event_id   INTEGER NOT NULL,
+    point_id   INTEGER NOT NULL,
+    PRIMARY KEY (event_id, point_id)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_event_evidence_point
+    ON event_evidence (point_id);
 
 CREATE TABLE IF NOT EXISTS schema_meta (
     key   TEXT PRIMARY KEY,

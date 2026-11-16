@@ -362,12 +362,21 @@ def _reconcile_vessel(
                 batch_id,
             ),
         )
+        event_id = int(cursor.lastrowid)
+        # Freeze the exact point ids this event id was published with.  The
+        # snapshot is insert-only: later uploads that retract this id create a
+        # new id with its own snapshot, and duplicate re-uploads never reach
+        # this code path because raw_points dedupes them.
+        conn.executemany(
+            "INSERT INTO event_evidence (event_id, point_id) VALUES (?, ?)",
+            [(event_id, point_id) for point_id in stay.point_ids],
+        )
         _append_change(
             conn,
             batch_id=batch_id,
             port_id=port.id,
             change_type="upsert",
-            event_id=cursor.lastrowid,
+            event_id=event_id,
             stay=stay,
             created_at=created_at,
         )
@@ -606,3 +615,175 @@ def latest_cursor(conn: sqlite3.Connection, *, port_code: str) -> int:
         (port.id,),
     ).fetchone()
     return int(row["s"])
+
+
+def _iso_utc(epoch_seconds: int) -> str:
+    return datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+def _evidence_header(
+    conn: sqlite3.Connection, *, port: Port, event_id: int
+) -> dict[str, Any]:
+    """Locate an event id in either the live table or the retracted change log.
+
+    An id that has been retracted no longer has an ``events`` row, but its
+    upsert change record still carries the payload it was published with.
+    """
+    active = conn.execute(
+        "SELECT * FROM events WHERE port_id = ? AND id = ?",
+        (port.id, event_id),
+    ).fetchone()
+    if active is not None:
+        return {
+            "event_id": active["id"],
+            "status": "active",
+            "vessel_id": active["vessel_id"],
+            "start_time": active["start_time"],
+            "start_time_utc": _iso_utc(active["start_time"]),
+            "end_time": active["end_time"],
+            "end_time_utc": _iso_utc(active["end_time"]),
+            "duration_seconds": active["end_time"] - active["start_time"],
+            "point_count": active["point_count"],
+            "published_batch_id": active["created_batch_id"],
+        }
+
+    upsert = conn.execute(
+        """
+        SELECT * FROM event_changes
+        WHERE port_id = ? AND event_id = ? AND change_type = 'upsert'
+        ORDER BY seq
+        """,
+        (port.id, event_id),
+    ).fetchone()
+    if upsert is None:
+        raise AppError(
+            404,
+            "event_not_found",
+            (
+                f"event_id {event_id} is unknown in port {port.code!r}: "
+                "no active or retracted event with this id"
+            ),
+            {"port": port.code, "event_id": event_id},
+        )
+    return {
+        "event_id": upsert["event_id"],
+        "status": "retracted",
+        "vessel_id": upsert["vessel_id"],
+        "start_time": upsert["start_time"],
+        "start_time_utc": _iso_utc(upsert["start_time"]),
+        "end_time": upsert["end_time"],
+        "end_time_utc": _iso_utc(upsert["end_time"]),
+        "duration_seconds": upsert["end_time"] - upsert["start_time"],
+        "point_count": upsert["point_count"],
+        "published_batch_id": upsert["batch_id"],
+    }
+
+
+def get_event_evidence(
+    conn: sqlite3.Connection,
+    *,
+    port_code: str,
+    event_id: int,
+    after_point_id: int = 0,
+    limit: int = 1000,
+) -> dict[str, Any]:
+    """Return the frozen point evidence of one event id, paged by point id.
+
+    The evidence rows are an immutable snapshot, so keyset pagination on
+    ``point_id`` stays stable even while another instance keeps uploading: a
+    continuing reader can neither see a row twice nor skip one, and
+    ``evidence_count`` always equals the event's published ``point_count``.
+    """
+    port = get_port(conn, port_code)
+    header = _evidence_header(conn, port=port, event_id=event_id)
+
+    total = conn.execute(
+        "SELECT COUNT(*) AS n FROM event_evidence WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()["n"]
+
+    rows = conn.execute(
+        """
+        SELECT rp.id AS point_id, rp.vessel_id, rp.event_time, rp.lat_e6,
+               rp.lon_e6, rp.batch_id AS upload_batch_id,
+               ib.received_at AS upload_batch_received_at
+        FROM event_evidence AS ee
+        JOIN raw_points AS rp ON rp.id = ee.point_id
+        JOIN ingest_batches AS ib ON ib.id = rp.batch_id
+        WHERE ee.event_id = ? AND ee.point_id > ?
+        ORDER BY ee.point_id
+        LIMIT ?
+        """,
+        (event_id, after_point_id, limit + 1),
+    ).fetchall()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    points = [
+        {
+            "point_id": row["point_id"],
+            "vessel_id": row["vessel_id"],
+            "event_time": row["event_time"],
+            "event_time_utc": _iso_utc(row["event_time"]),
+            "lat": row["lat_e6"] / 1e6,
+            "lon": row["lon_e6"] / 1e6,
+            "upload_batch_id": row["upload_batch_id"],
+            "upload_batch_received_at": row["upload_batch_received_at"],
+        }
+        for row in rows
+    ]
+    next_cursor = rows[-1]["point_id"] if rows else after_point_id
+    return {
+        "port_id": port.id,
+        "event": header,
+        "evidence_count": total,
+        "count": len(points),
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+        "points": points,
+    }
+
+
+def backfill_event_evidence(conn: sqlite3.Connection) -> int:
+    """Recreate evidence snapshots for live events created before version 2.
+
+    Databases created by the previous schema have no ``event_evidence`` rows.
+    Active events can be reconstructed deterministically from the stored raw
+    points by re-deriving each vessel's stays.  Events that had already been
+    retracted before the upgrade cannot be reconstructed (their ids only
+    survive in ``event_changes``); they still return their header from the
+    change log but have no point-level evidence.  Idempotent: events that
+    already have a snapshot are skipped.
+    """
+    port_rows = conn.execute("SELECT * FROM ports ORDER BY id").fetchall()
+    inserted = 0
+    for port_row in port_rows:
+        port = _port_from_row(port_row)
+        missing = conn.execute(
+            """
+            SELECT e.* FROM events AS e
+            WHERE NOT EXISTS (
+                SELECT 1 FROM event_evidence AS ee WHERE ee.event_id = e.id
+            )
+            ORDER BY e.id
+            """
+        ).fetchall()
+        if not missing:
+            continue
+        vessel_ids = {row["vessel_id"] for row in missing}
+        points_by_vessel = _load_points_for_vessels(conn, port.id, vessel_ids)
+        stays_by_key: dict[tuple[str, int], event_rules.Stay] = {}
+        for vessel_id, points in points_by_vessel.items():
+            for stay in event_rules.derive_stays(points, port.contains):
+                stays_by_key[stay.key] = stay
+        for event in missing:
+            stay = stays_by_key.get((event["vessel_id"], event["start_time"]))
+            if stay is None:
+                continue
+            conn.executemany(
+                "INSERT INTO event_evidence (event_id, point_id) VALUES (?, ?)",
+                [(event["id"], point_id) for point_id in stay.point_ids],
+            )
+            inserted += len(stay.point_ids)
+    return inserted

@@ -63,6 +63,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             resolved.db_path,
             busy_timeout_ms=resolved.sqlite_busy_timeout_ms,
         )
+        # Recreate evidence snapshots for live events created by a pre-v2
+        # database.  A no-op on freshly initialised databases; serialised by
+        # BEGIN IMMEDIATE when two instances start at the same time.
+        with db.connect(
+            resolved.db_path,
+            busy_timeout_ms=resolved.sqlite_busy_timeout_ms,
+        ) as upgrade_conn:
+            with db.write_transaction(upgrade_conn):
+                service.backfill_event_evidence(upgrade_conn)
         yield
 
     app = FastAPI(
@@ -79,7 +88,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "- 停留首末相距 ≥ 30 分钟才形成事件。\n"
             "- 迟到点改变事件时，未变事件保留 event_id；被改变事件按旧号撤回"
             "（retract），新事件以新号加入（upsert）。变更按 `seq` 游标顺序读取。\n"
-            "- 每次上传的原始点、现役事件、变更记录在同一个 SQLite 写事务中提交。\n\n"
+            "- 每次上传的原始点、现役事件、变更记录在同一个 SQLite 写事务中提交。\n"
+            "- 每个 event_id 发布时冻结其点位证据（`event_evidence`），现役与"
+            "已撤回编号均可经 `/ports/{code}/events/{id}/evidence` 按 point_id "
+            "分页查询；撤回不改变旧证据，补点只进入新编号的快照。\n\n"
             "**在 /docs 演示迟到补点与撤回**：展开 `POST /demo/run`，点击 "
             "Try it out -> Execute。响应内含修改前后事件、retract/upsert 变更"
             "及保留编号的事件，可直接观察。"
@@ -88,6 +100,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             {"name": "ports", "description": "港区矩形范围登记"},
             {"name": "uploads", "description": "CSV 点位上传（原子、幂等）"},
             {"name": "events", "description": "当前现役靠港停留事件"},
+            {"name": "evidence", "description": "事件发布时依据的 AIS 点位证据（现役与已撤回均可查）"},
             {"name": "changes", "description": "按游标顺序读取的事件变更流"},
             {"name": "demo", "description": "迟到补点与撤回演示"},
             {"name": "system", "description": "健康检查"},
@@ -326,6 +339,42 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
 
     @app.get(
+        "/ports/{port_code}/events/{event_id}/evidence",
+        tags=["evidence"],
+        summary="按港区与 event_id 查询事件发布时的点位证据",
+        description=(
+            "返回事件起止时刻、点数与构成该事件的原始 AIS 点位，按原始点编号 "
+            "`point_id` 升序 keyset 分页（`after_point_id` + `limit`）。\n\n"
+            "- **现役与已撤回事件均可查**：已撤回编号返回 `status=retracted`，"
+            "其证据冻结在发布当时；补点后生成的新编号拥有包含补点的独立快照。\n"
+            "- 证据只增不改：同点重传在 `raw_points` 去重，不会改写任何既有编号的证据。\n"
+            "- 分页期间其它实例继续上传时，快照行不可变，续读不会重复或遗漏；"
+            "`evidence_count` 恒等于事件的 `point_count`。\n"
+            "- 每个点位含船舶号、UTC 时间（epoch 秒与 ISO-8601）、坐标及最初上传批次。\n"
+            "- 港区下不存在的编号（含其它港区的编号）返回 404 `event_not_found`。"
+        ),
+        responses={
+            200: {"description": "事件存在（现役或已撤回），返回冻结的点位证据"},
+            404: {"description": "港区未登记，或该港区下无此 event_id"},
+        },
+    )
+    def read_event_evidence(
+        port_code: str,
+        event_id: int,
+        conn: Db,
+        after_point_id: int = Query(default=0, ge=0),
+        limit: int = Query(default=1000, ge=1, le=10000),
+    ) -> dict:
+        with db.read_snapshot(conn):
+            return service.get_event_evidence(
+                conn,
+                port_code=port_code,
+                event_id=event_id,
+                after_point_id=after_point_id,
+                limit=limit,
+            )
+
+    @app.get(
         "/ports/{port_code}/changes",
         tags=["changes"],
         summary="按游标顺序读取事件变更",
@@ -469,6 +518,32 @@ def _run_demo(conn: sqlite3.Connection) -> dict:
     ]
     unchanged = sorted(before_ids & after_ids)
 
+    evidence_summary = []
+    for label, ids in (
+        ("retracted_old_event", retracted),
+        ("replacement_new_event", added),
+    ):
+        for target_id in ids:
+            page_one = service.get_event_evidence(
+                conn,
+                port_code=port_code,
+                event_id=target_id,
+                limit=1000,
+            )
+            evidence_summary.append(
+                {
+                    "role": label,
+                    "event_id": target_id,
+                    "status": page_one["event"]["status"],
+                    "point_count": page_one["event"]["point_count"],
+                    "evidence_count": page_one["evidence_count"],
+                    "evidence_point_ids": [p["point_id"] for p in page_one["points"]],
+                    "query_path": (
+                        f"/ports/{port_code}/events/{target_id}/evidence"
+                    ),
+                }
+            )
+
     return {
         "demo_port": port_code,
         "narrative": [
@@ -493,6 +568,7 @@ def _run_demo(conn: sqlite3.Connection) -> dict:
             "changes_after_cursor": change_page,
         },
         "final_events": after,
+        "evidence": evidence_summary,
         "summary": {
             "retracted_event_ids": retracted,
             "added_event_ids": added,

@@ -114,6 +114,29 @@ def main() -> None:
     print("retracted ids:", sorted(baseline_ids - final_ids))
     print("added ids:", sorted(final_ids - baseline_ids))
 
+    print("\npoint evidence audit:")
+    for label, ids in (
+        ("retracted", sorted(baseline_ids - final_ids)),
+        ("active", sorted(final_ids)),
+    ):
+        for event_id in ids:
+            page = request(
+                "GET", f"/ports/{PORT_CODE}/events/{event_id}/evidence"
+            )
+            header = page["event"]
+            print(
+                f"  event_id={event_id} [{label}] status={header['status']} "
+                f"{header['start_time_utc']}..{header['end_time_utc']} "
+                f"point_count={header['point_count']} "
+                f"evidence_count={page['evidence_count']}"
+            )
+            for point in page["points"]:
+                print(
+                    f"    point_id={point['point_id']} {point['vessel_id']} "
+                    f"{point['event_time_utc']} ({point['lat']}, {point['lon']}) "
+                    f"upload_batch={point['upload_batch_id']}"
+                )
+
 
 if __name__ == "__main__":
     main()

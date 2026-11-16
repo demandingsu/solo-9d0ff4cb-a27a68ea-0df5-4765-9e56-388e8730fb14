@@ -48,6 +48,9 @@ class Stay:
     end_lat_e6: int
     end_lon_e6: int
     point_count: int
+    # Empty only for the synthetic Stay built when writing a retract change,
+    # where point-level payload is not carried; every derived stay fills it.
+    point_ids: tuple[int, ...] = ()
 
     @property
     def key(self) -> tuple[str, int]:
@@ -81,6 +84,7 @@ def derive_stays(
                 end_lat_e6=run[-1].lat_e6,
                 end_lon_e6=run[-1].lon_e6,
                 point_count=len(run),
+                point_ids=tuple(point.id for point in run),
             )
         )
 
